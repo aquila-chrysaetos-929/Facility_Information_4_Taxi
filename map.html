@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Facility Information / AISG</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .legend{
+      position:absolute; bottom:12px; left:12px; background:#fff; padding:8px 10px;
+      border:1px solid #ccc; font:12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      box-shadow:0 1px 4px rgba(0,0,0,.1); border-radius:6px;
+    }
+    .legend div{ display:flex; align-items:center; gap:6px; margin:4px 0; }
+    .dot{ width:10px; height:10px; border-radius:50%; display:inline-block; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="legend">
+    <strong>Legend</strong>
+    <div><span class="dot" style="background:#27ae60"></span> Parking ＆ On-street 可</div>
+    <div><span class="dot" style="background:#2ecc71"></span> Parking のみ可</div>
+    <div><span class="dot" style="background:#f39c12"></span> On-street のみ可</div>
+    <div><span class="dot" style="background:#95a5a6"></span> どちらも不可/不明</div>
+  </div>
+
+  <script>
+  // ★ここだけ差し替え
+  const GOOGLE_MAPS_API_KEY = "AIzaSyCSZuqqYdEkv9UmBdPptGpbgscxpoaC1ek";
+
+  // あなたのCSV（公開済み）
+  const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ93Od8zzXTlV5QRigiU9lI_Va7iC9dYJP0bqgaVrRXMvRz5tdpdWiIMpjl-fBOo4o0kzkbyr7Fdcg2/pub?gid=0&single=true&output=csv";
+
+  // CSVを雑にsplitせず、最低限のクォート対応
+  function parseCSV(text){
+    const rows = [];
+    let cur = [], cell = "", inQuotes = false;
+    for (let i=0; i<text.length; i++){
+      const c = text[i], n = text[i+1];
+      if (c === '"' ) {
+        if (inQuotes && n === '"'){ cell += '"'; i++; } else { inQuotes = !inQuotes; }
+      } else if (c === ',' && !inQuotes){ cur.push(cell); cell=""; }
+      else if ((c === '\n' || (c === '\r' && n !== '\n')) && !inQuotes){ cur.push(cell); rows.push(cur); cur=[]; cell=""; }
+      else if (c === '\r' && n === '\n' && !inQuotes){ cur.push(cell); rows.push(cur); cur=[]; cell=""; i++; }
+      else { cell += c; }
+    }
+    if (cell.length || cur.length) { cur.push(cell); rows.push(cur); }
+    return rows;
+  }
+
+  function toBool(v){
+    if (!v) return false;
+    const s = String(v).trim().toLowerCase();
+    return ["yes","y","true","t","1","ok","available"].includes(s);
+  }
+
+  function colorFor(parking, onStreet){
+    if (parking && onStreet) return "#e74c3c";     // both
+    if (parking && !onStreet) return "#e74c3c";    // parking only
+    if (!parking && onStreet) return "#e74c3c";    // on-street only
+    return "#95a5a6";                               // none/unknown
+  }
+
+  function pinStyle(color){
+    return {
+      path: google.maps.SymbolPath.CIRCLE,
+      scale: 6,
+      fillColor: color,
+      fillOpacity: 1,
+      strokeColor: "#333",
+      strokeWeight: 1
+    };
+  }
+
+  let map, clusterer;
+
+  async function initMap(){
+    map = new google.maps.Map(document.getElementById("map"), {
+      center: { lat: 35.681236, lng: 139.767125 }, // 東京駅付近
+      zoom: 6,
+      mapId: "DEMO_MAP"
+    });
+
+    const resp = await fetch(CSV_URL, { cache: "no-store" });
+    if (!resp.ok){ console.error("CSV取得失敗"); return; }
+    const text = await resp.text();
+    const rows = parseCSV(text);
+    if (!rows.length) return;
+
+    // ヘッダ取り出し（列名は提示どおり）
+    const headers = rows[0].map(h => h.trim());
+    const idx = (name) => headers.findIndex(h => h.toLowerCase() === name.toLowerCase());
+
+    const iName = idx("name");
+    const iLat  = idx("latitude");
+    const iLng  = idx("longitude");
+    const iType = idx("category");
+    const iOpen = idx("opening_hours");
+    const iRoad = idx("road_width_m");
+    const iPk   = idx("parking_available");
+    const iOnSt = idx("on_road_parking");
+    const iAdd  = idx("additional_information");
+    
+    const markers = [];
+    const bounds = new google.maps.LatLngBounds();
+    const info = new google.maps.InfoWindow();
+
+    for (let r=1; r<rows.length; r++){
+      const row = rows[r];
+      const lat = parseFloat(row[iLat]);
+      const lng = parseFloat(row[iLng]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+      const name = row[iName] || "(no name)";
+      const type = row[iType] || "";
+      const open = row[iOpen] || "";
+      const road = row[iRoad] || "";
+      const parking = toBool(row[iPk]);
+      const onStreet = toBool(row[iOnSt]);
+      const addinfo = row[iAdd] || "";
+
+      const marker = new google.maps.Marker({
+        position: { lat, lng },
+        title: name,
+        icon: pinStyle(colorFor(parking, onStreet))
+      });
+
+      const html = `
+        <div style="font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width:260px">
+          <div style="font-weight:600; margin-bottom:4px">${name}</div>
+          <table style="border-collapse:collapse; width:100%; font-size:12px">
+            <tr><td style="color:#555">Type</td><td>${type}</td></tr>
+            <tr><td style="color:#555">Opening</td><td>${open}</td></tr>
+            <tr><td style="color:#555">Road width (m)</td><td>${road}</td></tr>
+            <tr><td style="color:#555">Parking</td><td>${parking ? "Available" : "No"}</td></tr>
+            <tr><td style="color:#555">On-street</td><td>${onStreet ? "Available" : "No"}</td></tr>
+            <tr><td style="color:#555">Lat/Lng</td><td>${lat.toFixed(6)}, ${lng.toFixed(6)}</td></tr>
+            <tr><td style="color:#555">Info</td><td>${addinfo}</td></tr>
+          </table>
+        </div>`;
+      // Delete Start 2025.11.03
+      //  marker.addListener("click", () => {
+      //  info.setContent(html);
+      //  info.open({ map, anchor: marker }); });
+      // Delete End  2025.11.03
+
+      // Insert Start 2025.11.03 経路探索導入用
+        marker.addListener("click", () => {
+        const lat = marker.getPosition().lat();
+        const lng = marker.getPosition().lng();
+      // 経路ボタン付きの情報ウィンドウ
+        const html = `
+        <div style="font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width:260px">
+        <div style="font-weight:600; margin-bottom:4px">${name}</div>
+        <table style="border-collapse:collapse; width:100%; font-size:12px">
+        <tr><td style="color:#555">Type</td><td>${type}</td></tr>
+        <tr><td style="color:#555">Opening</td><td>${open}</td></tr>
+        <tr><td style="color:#555">Road width (m)</td><td>${road}</td></tr>
+        <tr><td style="color:#555">Parking</td><td>${parking ? "Available" : "No"}</td></tr>
+        <tr><td style="color:#555">On-street</td><td>${onStreet ? "Available" : "No"}</td></tr>
+        <tr><td style="color:#555">Lat/Lng</td><td>${lat.toFixed(6)}, ${lng.toFixed(6)}</td></tr>
+        <tr><td style="color:#555">Info</td><td>${addinfo}</td></tr>
+        </table>
+        <div style="margin-top:6px; text-align:right">
+          <a href="https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}" target="_blank"
+           style="text-decoration:none; background:#4285F4; color:#fff; padding:4px 8px; border-radius:4px; font-size:12px;">
+         Googleマップで経路表示
+            </a>
+        </div>
+    </div>`;
+        info.setContent(html);
+        info.open({ map, anchor: marker });
+    });
+        // Insert End 2025.11.03
+
+      markers.push(marker);
+      bounds.extend(marker.getPosition());
+    }
+
+    // クラスタリング
+    // @googlemaps/markerclusterer を利用
+    clusterer = new markerClusterer.MarkerClusterer({ map, markers });
+
+    if (!bounds.isEmpty()) map.fitBounds(bounds);
+
+  // 2025.11.03 inserted start
+  // 位置情報を取得して地図を移動
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(
+    (position) => {
+      const pos = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude
+      };
+      map.setCenter(pos);     // 現在地に移動
+      map.setZoom(15);        // 15〜17あたりでちょうど良い
+      new google.maps.Marker({
+        position: pos,
+        map: map,
+        title: "現在地",
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 7,
+          fillColor: "#4285F4",
+          fillOpacity: 1,
+          strokeColor: "#fff",
+          strokeWeight: 2
+        }
+      });
+    },
+    () => {
+      console.warn("位置情報が許可されませんでした。");
+    }
+  );
+} else {
+  console.warn("このブラウザは位置情報をサポートしていません。");
+}
+  // 2025.11.03 inserted end    
+  }
+
+
+
+  // 動的ロード：Maps API ＋ MarkerClusterer
+  (function load(){
+    const s1 = document.createElement("script");
+    s1.src = "https://unpkg.com/@googlemaps/markerclusterer/dist/index.min.js";
+    s1.defer = true;
+    s1.onload = () => {
+      const s2 = document.createElement("script");
+      s2.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}&callback=initMap&v=weekly`;
+      s2.defer = true;
+      document.head.appendChild(s2);
+    };
+    document.head.appendChild(s1);
+  })();
+  </script>
+
+  <!-- === Inserted Start 2025.11.04 ナビ＆QR対応スクリプト === -->
+  <script>
+function openNav(lat, lng, mode = "driving") {
+  const ua = navigator.userAgent || "";
+  const isAndroid = /Android/i.test(ua);
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const webURL = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}&travelmode=${mode}&dir_action=navigate`;
+
+  if (isAndroid) {
+    const app = `google.navigation:q=${lat},${lng}&mode=${mode[0] || "d"}`;
+    window.location.href = app;
+    setTimeout(() => { window.location.href = webURL; }, 800);
+    return;
+  }
+  if (isIOS) {
+    const app = `comgooglemaps://?daddr=${lat},${lng}&directionsmode=${mode}`;
+    window.location.href = app;
+    setTimeout(() => { window.location.href = webURL; }, 800);
+    return;
+  }
+  window.open(webURL, "_blank");
+  showQr(webURL);
+}
+
+function showQr(text){
+  const id = "qr-popup";
+  document.getElementById(id)?.remove();
+  const div = document.createElement("div");
+  div.id = id;
+  div.style.cssText = "position:fixed;right:12px;bottom:12px;background:#fff;border:1px solid #ccc;padding:10px 12px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.15);z-index:9999;font:12px system-ui";
+  div.innerHTML = `
+    <div style="margin-bottom:6px">スマホで続きます（カメラでQRを読み取り）</div>
+    <img alt="QR" src="https://chart.googleapis.com/chart?cht=qr&chs=180x180&chl=${encodeURIComponent(text)}">
+    <div style="text-align:right;margin-top:6px">
+      <button onclick="this.closest('#qr-popup').remove()">閉じる</button>
+    </div>`;
+  document.body.appendChild(div);
+}
+</script>
+<!-- === /Inserted End 2025.11.04 ナビ＆QR対応スクリプト === -->
+</body>
+</html>
